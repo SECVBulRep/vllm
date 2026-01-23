@@ -9,6 +9,28 @@ import string
 from vllm import LLM
 from vllm.sampling_params import SamplingParams
 
+
+import re
+import json
+
+def parse_tool_calls(text: str):
+    # 1) Try <tool_call> ... </tool_call>
+    m = re.search(r"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>", text)
+    if m:
+        return [json.loads(m.group(1))]  # make it a list to match your existing code
+
+    # 2) Try pure JSON object
+    text = text.strip()
+    if text.startswith("{"):
+        return [json.loads(text)]
+
+    # 3) Try JSON array
+    if text.startswith("["):
+        return json.loads(text)
+
+    raise ValueError(f"Can't parse tool calls from: {text!r}")
+
+
 # This script is an offline demo for function calling
 #
 # If you want to run a server/client setup, please follow this code:
@@ -135,7 +157,7 @@ messages.append(
 
 print("RAW OUTPUT >>>", repr(output))
 
-tool_calls = json.loads(output)
+tool_calls = parse_tool_calls(output)
 tool_answers = [
     tool_functions[call["name"]](**call["arguments"]) for call in tool_calls
 ]
