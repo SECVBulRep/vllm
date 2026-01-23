@@ -105,10 +105,19 @@ tools = [
 
 messages = [
     {
+        "role": "system",
+        "content": (
+            "You are a function-calling assistant. "
+            "If a tool is needed, respond with ONLY a JSON array of tool calls. "
+            "No extra text. JSON only."
+        ),
+    },
+    {
         "role": "user",
-        "content": "Can you tell me what the temperate will be in Dallas, in fahrenheit?",
-    }
+        "content": "Can you tell me what the temperature will be in Dallas, TX in fahrenheit?",
+    },
 ]
+
 
 outputs = llm.chat(messages, sampling_params=sampling_params, tools=tools)
 output = outputs[0].outputs[0].text.strip()
@@ -123,6 +132,9 @@ messages.append(
 
 # let's now actually parse and execute the model's output simulating an API call by using the
 # above defined function
+
+print("RAW OUTPUT >>>", repr(output))
+
 tool_calls = json.loads(output)
 tool_answers = [
     tool_functions[call["name"]](**call["arguments"]) for call in tool_calls
