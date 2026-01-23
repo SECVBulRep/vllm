@@ -52,11 +52,9 @@ model_name = "mistralai/Mistral-7B-Instruct-v0.3"
 
 sampling_params = SamplingParams(max_tokens=8192, temperature=0.0)
 llm = LLM(
-    model=model_name,
-    tokenizer_mode="mistral",
-    config_format="mistral",
-    load_format="mistral",
+    model="Qwen/Qwen2.5-1.5B-Instruct",
 )
+
 
 
 def generate_random_id(length=9):
