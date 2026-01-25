@@ -101,7 +101,7 @@ def main(args):
     sampling_params = SamplingParams(
         temperature=0,
         top_p=1.0,
-        max_tokens=64,
+        max_tokens=1024,
         skip_special_tokens=False,
     )
 
