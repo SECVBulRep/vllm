@@ -27,7 +27,7 @@ def run_whisper():
 
     engine_args = EngineArgs(
         model="openai/whisper-large-v3-turbo",
-        max_model_len=448,
+        max_model_len=4096,
         max_num_seqs=16,
         limit_mm_per_prompt={"audio": 1},
         dtype="half",
