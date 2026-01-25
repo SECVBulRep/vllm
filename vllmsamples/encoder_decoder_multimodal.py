@@ -14,6 +14,7 @@ from typing import NamedTuple
 from vllm import LLM, EngineArgs, PromptType, SamplingParams
 from vllm.assets.audio import AudioAsset
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+import librosa
 
 
 class ModelRequestData(NamedTuple):
@@ -32,28 +33,23 @@ def run_whisper():
         dtype="half",
     )
 
+    # 👉 твой файл
+    audio, sr = librosa.load("/mnt/c/Users/Bulat/Downloads/test.mp3", sr=None)
+
     prompts = [
-        {  # Test implicit prompt
+        {
             "prompt": "<|startoftranscript|>",
             "multi_modal_data": {
-                "audio": AudioAsset("mary_had_lamb").audio_and_sample_rate,
+                "audio": (audio, sr),
             },
-        },
-        {  # Test explicit encoder/decoder prompt
-            "encoder_prompt": {
-                "prompt": "",
-                "multi_modal_data": {
-                    "audio": AudioAsset("winning_call").audio_and_sample_rate,
-                },
-            },
-            "decoder_prompt": "<|startoftranscript|>",
-        },
+        }
     ]
 
     return ModelRequestData(
         engine_args=engine_args,
         prompts=prompts,
     )
+
 
 
 model_example_map = {
