@@ -15,7 +15,22 @@ from transformers import (
     TrainingArguments,
 )
 from peft import LoraConfig
+
+# Определяем версию trl и импортируем правильно
+import trl
+
+TRL_VERSION = tuple(map(int, trl.__version__.split('.')[:2]))
+
 from trl import SFTTrainer
+
+if TRL_VERSION >= (0, 12):
+    from trl import SFTConfig
+
+    USE_NEW_API = True
+else:
+    USE_NEW_API = False
+
+print(f"TRL version: {trl.__version__} (USE_NEW_API={USE_NEW_API})")
 
 
 def create_bnb_config():
@@ -81,27 +96,39 @@ def load_chat_dataset(dataset_name: str):
     return dataset
 
 
-def create_training_config(output_dir: str):
+def create_training_config(output_dir: str, max_seq_length: int):
     """Настройки обучения для ~10 минут на 24GB GPU."""
 
-    return TrainingArguments(
+    base_args = dict(
         output_dir=output_dir,
-        num_train_epochs=1,  # 1 эпоха достаточно для демо
-        per_device_train_batch_size=4,  # Батч для 24GB
-        gradient_accumulation_steps=4,  # Эффективный батч = 16
-        optim="paged_adamw_32bit",  # Оптимизатор с пейджингом
+        num_train_epochs=1,
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=4,
+        optim="paged_adamw_32bit",
         learning_rate=2e-4,
         weight_decay=0.001,
         fp16=False,
-        bf16=True,  # BFloat16 для Ampere+
+        bf16=True,
         max_grad_norm=0.3,
         warmup_ratio=0.03,
-        group_by_length=True,  # Группировка по длине
+        group_by_length=True,
         lr_scheduler_type="cosine",
         logging_steps=25,
         save_strategy="epoch",
-        report_to="none",  # Без wandb/tensorboard
+        report_to="none",
     )
+
+    if USE_NEW_API:
+        # trl >= 0.12: используем SFTConfig
+        return SFTConfig(
+            **base_args,
+            max_seq_length=max_seq_length,
+            packing=False,
+            dataset_text_field="text",
+        )
+    else:
+        # trl < 0.12: используем TrainingArguments
+        return TrainingArguments(**base_args)
 
 
 def train_lora(
@@ -130,23 +157,31 @@ def train_lora(
     # Загружаем датасет
     dataset = load_chat_dataset(dataset_name)
 
-    # Функция форматирования для датасета
-    def formatting_prompts_func(examples):
-        return examples["text"]
-
     # Настройки обучения
-    training_args = create_training_config(output_dir)
+    training_config = create_training_config(output_dir, max_seq_length)
 
-    # Создаём тренер
-    trainer = SFTTrainer(
-        model=model,
-        train_dataset=dataset,
-        formatting_func=formatting_prompts_func,
-        processing_class=tokenizer,
-        args=training_args,
-        peft_config=lora_config,
-        max_seq_length=max_seq_length,
-    )
+    # Создаём тренер (разные API для разных версий trl)
+    if USE_NEW_API:
+        # trl >= 0.12
+        trainer = SFTTrainer(
+            model=model,
+            train_dataset=dataset,
+            processing_class=tokenizer,
+            args=training_config,
+            peft_config=lora_config,
+        )
+    else:
+        # trl < 0.12
+        trainer = SFTTrainer(
+            model=model,
+            train_dataset=dataset,
+            dataset_text_field="text",
+            tokenizer=tokenizer,
+            args=training_config,
+            peft_config=lora_config,
+            max_seq_length=max_seq_length,
+            packing=False,
+        )
 
     # Обучаем
     print("\nНачинаем обучение...")
