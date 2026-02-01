@@ -12,9 +12,10 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
+    TrainingArguments,
 )
 from peft import LoraConfig
-from trl import SFTTrainer, SFTConfig
+from trl import SFTTrainer
 
 
 def create_bnb_config():
@@ -80,10 +81,10 @@ def load_chat_dataset(dataset_name: str):
     return dataset
 
 
-def create_training_config(output_dir: str, max_seq_length: int):
+def create_training_config(output_dir: str):
     """Настройки обучения для ~10 минут на 24GB GPU."""
 
-    return SFTConfig(
+    return TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=1,  # 1 эпоха достаточно для демо
         per_device_train_batch_size=4,  # Батч для 24GB
@@ -100,8 +101,6 @@ def create_training_config(output_dir: str, max_seq_length: int):
         logging_steps=25,
         save_strategy="epoch",
         report_to="none",  # Без wandb/tensorboard
-        max_seq_length=max_seq_length,  # Максимальная длина
-        packing=False,
     )
 
 
@@ -136,7 +135,7 @@ def train_lora(
         return examples["text"]
 
     # Настройки обучения
-    sft_config = create_training_config(output_dir, max_seq_length)
+    training_args = create_training_config(output_dir)
 
     # Создаём тренер
     trainer = SFTTrainer(
@@ -144,8 +143,9 @@ def train_lora(
         train_dataset=dataset,
         formatting_func=formatting_prompts_func,
         tokenizer=tokenizer,
-        args=sft_config,
+        args=training_args,
         peft_config=lora_config,
+        max_seq_length=max_seq_length,
     )
 
     # Обучаем
