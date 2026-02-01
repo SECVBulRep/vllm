@@ -22,6 +22,7 @@ class AdapterConfig(NamedTuple):
     name: str
     label: str
     emoji: str
+    lora_id: int = 0  # Фиксированный ID для LoRA
     path: str | None = None
 
 
@@ -56,7 +57,6 @@ def create_test_prompts(
     )
 
     test_prompts = []
-    lora_id = 1  # ID для LoRA запросов
 
     for prompt in prompts:
         for adapter in adapters:
@@ -64,8 +64,8 @@ def create_test_prompts(
                 # Базовая модель без адаптера
                 lora_request = None
             else:
-                lora_request = LoRARequest(adapter.name, lora_id, adapter.path)
-                lora_id += 1
+                # Используем фиксированный lora_id из конфига адаптера
+                lora_request = LoRARequest(adapter.name, adapter.lora_id, adapter.path)
 
             test_prompts.append((
                 prompt,
@@ -181,24 +181,27 @@ def main():
 
     print(f"📂 Используем CHAT-LoRA адаптер: {config['chat_lora_path']}")
 
-    # Конфигурация адаптеров
+    # Конфигурация адаптеров с фиксированными ID
     adapters = [
         AdapterConfig(
             name="base",
             label="BASE",
             emoji="🔵",
+            lora_id=0,
             path=None,  # Без адаптера
         ),
         AdapterConfig(
             name="flan-lora",
             label="FLAN-LoRA",
             emoji="🟢",
+            lora_id=1,
             path=flan_lora_path,
         ),
         AdapterConfig(
             name="chat-lora",
             label="CHAT-LoRA",
             emoji="🟣",
+            lora_id=2,
             path=config["chat_lora_path"],
         ),
     ]
