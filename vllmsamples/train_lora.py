@@ -142,7 +142,7 @@ def train_lora(
         model=model,
         train_dataset=dataset,
         formatting_func=formatting_prompts_func,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         args=training_args,
         peft_config=lora_config,
         max_seq_length=max_seq_length,
