@@ -12,10 +12,9 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
-    TrainingArguments,
 )
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from trl import SFTTrainer
+from peft import LoraConfig
+from trl import SFTTrainer, SFTConfig
 
 
 def create_bnb_config():
@@ -81,10 +80,10 @@ def load_chat_dataset(dataset_name: str):
     return dataset
 
 
-def create_training_arguments(output_dir: str):
+def create_training_config(output_dir: str, max_seq_length: int):
     """Настройки обучения для ~10 минут на 24GB GPU."""
 
-    return TrainingArguments(
+    return SFTConfig(
         output_dir=output_dir,
         num_train_epochs=1,  # 1 эпоха достаточно для демо
         per_device_train_batch_size=4,  # Батч для 24GB
@@ -101,6 +100,8 @@ def create_training_arguments(output_dir: str):
         logging_steps=25,
         save_strategy="epoch",
         report_to="none",  # Без wandb/tensorboard
+        max_seq_length=max_seq_length,  # Максимальная длина
+        packing=False,
     )
 
 
@@ -123,30 +124,28 @@ def train_lora(
     # Загружаем модель
     model, tokenizer = load_model_and_tokenizer(model_name, bnb_config)
 
-    # Подготавливаем модель для k-bit обучения
-    model = prepare_model_for_kbit_training(model)
-    model = get_peft_model(model, lora_config)
-
-    # Статистика параметров
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # Статистика параметров (до применения LoRA)
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"\nОбучаемые параметры: {trainable_params:,} ({100 * trainable_params / total_params:.2f}%)")
+    print(f"\nВсего параметров базовой модели: {total_params:,}")
 
     # Загружаем датасет
     dataset = load_chat_dataset(dataset_name)
 
+    # Функция форматирования для датасета
+    def formatting_prompts_func(examples):
+        return examples["text"]
+
     # Настройки обучения
-    training_args = create_training_arguments(output_dir)
+    sft_config = create_training_config(output_dir, max_seq_length)
 
     # Создаём тренер
     trainer = SFTTrainer(
         model=model,
         train_dataset=dataset,
-        dataset_text_field="text",
-        max_seq_length=max_seq_length,
+        formatting_func=formatting_prompts_func,
         tokenizer=tokenizer,
-        args=training_args,
-        packing=False,
+        args=sft_config,
+        peft_config=lora_config,
     )
 
     # Обучаем
