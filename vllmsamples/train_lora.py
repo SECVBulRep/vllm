@@ -122,7 +122,7 @@ def create_training_config(output_dir: str, max_seq_length: int):
         # trl >= 0.12: используем SFTConfig
         return SFTConfig(
             **base_args,
-            max_seq_length=max_seq_length,
+            max_length=max_seq_length,
             packing=False,
             dataset_text_field="text",
         )
