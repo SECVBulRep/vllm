@@ -12,7 +12,7 @@
   - --reset для очистки прогресса и начала с нуля
 
 Использование:
-  pip install psycopg2-binary requests
+  pip install psycopg2-binary requests tqdm
   python redmine_wiki_dataset.py --output dataset.json
   python redmine_wiki_dataset.py --output dataset.json          # повторный запуск — обработает только новые
   python redmine_wiki_dataset.py --output dataset.json --reset  # начать с нуля
@@ -27,6 +27,7 @@ import sys
 import os
 import hashlib
 from pathlib import Path
+from tqdm import tqdm
 
 # ============================================================
 # 1. НАСТРОЙКИ
@@ -56,7 +57,7 @@ SYSTEM_PROMPT = (
 )
 
 QA_PER_PAGE_MIN = 3
-QA_PER_PAGE_MAX = 10
+QA_PER_PAGE_MAX = 7
 LLM_DELAY = 1.0
 LLM_RETRIES = 2  # повторные попытки при ошибке парсинга JSON
 
@@ -306,13 +307,13 @@ def generate_qa_for_page(page: dict) -> list[dict]:
 
         except json.JSONDecodeError as e:
             if attempt < LLM_RETRIES:
-                print(f"\n    ⚠ JSON ошибка (попытка {attempt+1}/{LLM_RETRIES+1}), повтор...", end="")
+                tqdm.write(f"    ⚠ JSON ошибка для '{title}' (попытка {attempt+1}/{LLM_RETRIES+1}), повтор...")
                 time.sleep(LLM_DELAY)
             else:
-                print(f"\n    ⚠ Не удалось распарсить JSON для '{title}' после {LLM_RETRIES+1} попыток")
+                tqdm.write(f"    ⚠ Не удалось распарсить JSON для '{title}' после {LLM_RETRIES+1} попыток → фоллбэк")
                 return fallback_template(page)
         except Exception as e:
-            print(f"\n    ⚠ Ошибка LLM для '{title}': {e}")
+            tqdm.write(f"    ⚠ Ошибка LLM для '{title}': {e} → фоллбэк")
             return fallback_template(page)
 
     return fallback_template(page)
@@ -431,13 +432,17 @@ def build_dataset(skip_llm: bool, output_path: str, progress_file: str) -> list[
     new_count = 0
     errors = 0
 
-    for i, page in enumerate(pages_to_process):
+    pbar = tqdm(pages_to_process, desc="🔄 Обработка", unit="стр",
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
+
+    for page in pbar:
         title = page["page_title"]
         text = page["page_content"] or ""
         pk = page_key(page)
         ch = content_hash(text)
 
-        print(f"  [{i+1}/{len(pages_to_process)}] {page['project_name']} / {title} ({len(text)} симв.) ", end="")
+        short_title = title[:40] + "…" if len(title) > 40 else title
+        pbar.set_postfix_str(f"{page['project_name']}/{short_title}", refresh=True)
 
         if skip_llm:
             examples = fallback_template(page)
@@ -453,7 +458,7 @@ def build_dataset(skip_llm: bool, output_path: str, progress_file: str) -> list[
         # Отмечаем как обработанную
         tracker.mark_processed(pk, ch, len(examples))
 
-        print(f"→ {len(examples)} Q&A ✓")
+    pbar.close()
 
     print(f"\n{'='*50}")
     print(f"✅ Новых Q&A примеров:  {new_count}")
