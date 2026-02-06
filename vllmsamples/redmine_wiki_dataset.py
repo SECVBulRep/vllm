@@ -3,11 +3,19 @@
 Формат: ShareGPT (для Qwen + LLaMA-Factory)
 
 Локальная LLM: openai/gpt-oss-20b на kurchatov-mini:8000
-Страницы анализируются ЦЕЛИКОМ (без разбивки на чанки).
+Страницы анализируются ЦЕЛИКОМ.
+
+Поддержка инкрементальной работы:
+  - Запоминает обработанные страницы в progress.json
+  - При повторном запуске пропускает уже обработанные
+  - Новые Q&A дописываются к существующему датасету
+  - --reset для очистки прогресса и начала с нуля
 
 Использование:
   pip install psycopg2-binary requests
   python redmine_wiki_dataset.py --output dataset.json
+  python redmine_wiki_dataset.py --output dataset.json          # повторный запуск — обработает только новые
+  python redmine_wiki_dataset.py --output dataset.json --reset  # начать с нуля
 """
 
 import json
@@ -16,6 +24,9 @@ import re
 import textwrap
 import time
 import sys
+import os
+import hashlib
+from pathlib import Path
 
 # ============================================================
 # 1. НАСТРОЙКИ
@@ -32,31 +43,94 @@ LLM_CONFIG = {
     "url": "http://kurchatov-mini:8000/v1/chat/completions",
     "model": "openai/gpt-oss-20b",
     "temperature": 0.1,
-    "max_tokens": 2000,
+    "max_tokens": 10000,
     "top_p": 1.0,
     "frequency_penalty": 0,
     "presence_penalty": 0,
 }
 
-# Системный промпт для итогового Q&A бота
 SYSTEM_PROMPT = (
     "Ты — ассистент по внутренней базе знаний компании. "
     "Отвечай на вопросы точно, опираясь на документацию. "
     "Если информация отсутствует в базе знаний, сообщи об этом."
 )
 
-# Сколько Q&A пар просить у LLM на одну страницу
 QA_PER_PAGE_MIN = 3
-QA_PER_PAGE_MAX = 7
-
-# Пауза между запросами к LLM (секунды)
+QA_PER_PAGE_MAX = 10
 LLM_DELAY = 1.0
+LLM_RETRIES = 2  # повторные попытки при ошибке парсинга JSON
 
 # ============================================================
-# 2. ИЗВЛЕЧЕНИЕ ДАННЫХ ИЗ POSTGRESQL
+# 2. ПРОГРЕСС — ЗАПОМИНАНИЕ ОБРАБОТАННЫХ СТРАНИЦ
+# ============================================================
+class ProgressTracker:
+    """
+    Хранит информацию об обработанных страницах.
+    Ключ = page_id (из БД) + hash содержимого.
+    Если содержимое страницы изменилось — она будет переобработана.
+    """
+
+    def __init__(self, progress_file: str):
+        self.progress_file = progress_file
+        self.data = self._load()
+
+    def _load(self) -> dict:
+        if os.path.exists(self.progress_file):
+            try:
+                with open(self.progress_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                return {"processed": {}}
+        return {"processed": {}}
+
+    def save(self):
+        with open(self.progress_file, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=2)
+
+    def is_processed(self, page_key: str, content_hash: str) -> bool:
+        """Проверяет, обработана ли страница с таким же содержимым."""
+        entry = self.data.get("processed", {}).get(page_key)
+        if entry and entry.get("content_hash") == content_hash:
+            return True
+        return False
+
+    def mark_processed(self, page_key: str, content_hash: str, qa_count: int):
+        """Отмечает страницу как обработанную."""
+        if "processed" not in self.data:
+            self.data["processed"] = {}
+        self.data["processed"][page_key] = {
+            "content_hash": content_hash,
+            "qa_count": qa_count,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self.save()
+
+    def reset(self):
+        """Очищает весь прогресс."""
+        self.data = {"processed": {}}
+        self.save()
+
+    @property
+    def total_processed(self) -> int:
+        return len(self.data.get("processed", {}))
+
+
+def content_hash(text: str) -> str:
+    """MD5-хеш содержимого страницы."""
+    return hashlib.md5((text or "").encode("utf-8")).hexdigest()
+
+
+def page_key(page: dict) -> str:
+    """Уникальный ключ страницы: project_id/page_title."""
+    return f"{page['project_id']}/{page['page_title']}"
+
+
+# ============================================================
+# 3. ИЗВЛЕЧЕНИЕ ДАННЫХ ИЗ POSTGRESQL
 # ============================================================
 WIKI_QUERY = """
-SELECT
+SELECT DISTINCT ON (wp.id)
+    wp.id                           AS wp_id,
     p.name                          AS project_name,
     p.identifier                    AS project_id,
     wp.title                        AS page_title,
@@ -74,7 +148,7 @@ LEFT JOIN wiki_pages parent_wp ON wp.parent_id = parent_wp.id
 WHERE wp.deleted_at IS NULL
   AND wc.text IS NOT NULL
   AND LENGTH(TRIM(wc.text)) > 50
-ORDER BY p.name, wp.title LIMIT 5;
+ORDER BY wp.id, wc.version DESC;
 """
 
 
@@ -94,43 +168,24 @@ def fetch_wiki_pages(db_config: dict) -> list[dict]:
 
 
 # ============================================================
-# 3. ОЧИСТКА REDMINE WIKI-РАЗМЕТКИ
+# 4. ОЧИСТКА REDMINE WIKI-РАЗМЕТКИ
 # ============================================================
 def clean_wiki_text(text: str) -> str:
     """Убирает Redmine/Textile разметку, оставляя чистый текст."""
     if not text:
         return ""
 
-    # Макросы {{...}}
     text = re.sub(r'\{\{.*?\}\}', '', text)
-
-    # Заголовки h1. h2. h3.
     text = re.sub(r'h[1-6]\.\s*', '', text)
-
-    # Жирный *text* и _курсив_
     text = re.sub(r'\*([^*]+)\*', r'\1', text)
     text = re.sub(r'_([^_]+)_', r'\1', text)
-
-    # Ссылки [[Page|text]] и [[Page]]
     text = re.sub(r'\[\[([^|\]]+)\|([^\]]+)\]\]', r'\2', text)
     text = re.sub(r'\[\[([^\]]+)\]\]', r'\1', text)
-
-    # Внешние ссылки "text":url
     text = re.sub(r'"([^"]+)":\S+', r'\1', text)
-
-    # Код <pre>, <code>
     text = re.sub(r'</?(?:pre|code)[^>]*>', '', text)
-
-    # HTML-теги
     text = re.sub(r'<[^>]+>', '', text)
-
-    # Списки: * или # в начале строки
     text = re.sub(r'^[*#]+\s*', '- ', text, flags=re.MULTILINE)
-
-    # Таблицы |_. (заголовки)
     text = re.sub(r'\|_\.', '', text)
-
-    # Лишние пробелы
     text = re.sub(r'\n{3,}', '\n\n', text)
     text = text.strip()
 
@@ -138,10 +193,10 @@ def clean_wiki_text(text: str) -> str:
 
 
 # ============================================================
-# 4. ГЕНЕРАЦИЯ Q&A ЧЕРЕЗ ЛОКАЛЬНУЮ LLM
+# 5. ГЕНЕРАЦИЯ Q&A ЧЕРЕЗ ЛОКАЛЬНУЮ LLM
 # ============================================================
 def call_llm(prompt: str) -> str:
-    """Отправляет запрос к локальной LLM на kurchatov-mini."""
+    """Отправляет запрос к локальной LLM."""
     import requests
 
     payload = {
@@ -164,20 +219,18 @@ def call_llm(prompt: str) -> str:
         LLM_CONFIG["url"],
         headers={"Content-Type": "application/json"},
         json=payload,
-        timeout=120,
+        timeout=180,
     )
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"]
 
 
 def parse_json_from_llm(text: str) -> list[dict]:
-    """Извлекает JSON-массив из ответа LLM (даже если обёрнут в markdown)."""
-    # Убираем ```json ... ```
+    """Извлекает JSON-массив из ответа LLM."""
     text = re.sub(r'```json\s*', '', text)
     text = re.sub(r'```\s*', '', text)
     text = text.strip()
 
-    # Ищем массив [ ... ]
     match = re.search(r'\[.*\]', text, re.DOTALL)
     if match:
         text = match.group(0)
@@ -186,9 +239,7 @@ def parse_json_from_llm(text: str) -> list[dict]:
 
 
 def generate_qa_for_page(page: dict) -> list[dict]:
-    """
-    Отправляет ПОЛНЫЙ текст страницы в LLM и получает Q&A пары.
-    """
+    """Отправляет ПОЛНЫЙ текст страницы в LLM и получает Q&A пары."""
     title = page["page_title"].replace("_", " ")
     project = page["project_name"]
     raw_text = page["page_content"] or ""
@@ -197,7 +248,6 @@ def generate_qa_for_page(page: dict) -> list[dict]:
     if len(clean_text) < 30:
         return []
 
-    # Кол-во пар в зависимости от длины текста
     text_len = len(clean_text)
     if text_len < 500:
         num_qa = QA_PER_PAGE_MIN
@@ -221,51 +271,55 @@ def generate_qa_for_page(page: dict) -> list[dict]:
 
         Требования:
         1. Вопросы должны быть разнообразными: общие, конкретные, практические.
-           Примеры типов вопросов:
-           - "Что такое ...?"
-           - "Как сделать ...?"
-           - "Какие шаги нужны для ...?"
-           - "Кто отвечает за ...?"
-           - "Где найти информацию о ...?"
         2. Вопросы — такие, какие реально задал бы сотрудник компании.
         3. Ответы должны быть полными и основываться ТОЛЬКО на тексте статьи.
         4. Ответы — развёрнутые, информативные, не менее 2-3 предложений.
         5. Не выдумывай информацию, которой нет в тексте.
 
-        Верни ТОЛЬКО валидный JSON массив, без пояснений и комментариев:
+        ВАЖНО: Верни ТОЛЬКО валидный JSON массив. Никакого текста до или после.
+        Убедись что все строки корректно закрыты кавычками.
         [
           {{"question": "...", "answer": "..."}},
           {{"question": "...", "answer": "..."}}
         ]
     """)
 
-    try:
-        response = call_llm(prompt)
-        qa_pairs = parse_json_from_llm(response)
+    # Попытки с ретраями
+    for attempt in range(LLM_RETRIES + 1):
+        try:
+            response = call_llm(prompt)
+            qa_pairs = parse_json_from_llm(response)
 
-        results = []
-        for qa in qa_pairs:
-            q = qa.get("question", "").strip()
-            a = qa.get("answer", "").strip()
-            if q and a and len(a) > 20:
-                results.append(make_sharegpt_entry(
-                    question=q,
-                    answer=a,
-                    project=project,
-                    page_title=title,
-                ))
-        return results
+            results = []
+            for qa in qa_pairs:
+                q = qa.get("question", "").strip()
+                a = qa.get("answer", "").strip()
+                if q and a and len(a) > 20:
+                    results.append(make_sharegpt_entry(
+                        question=q,
+                        answer=a,
+                        project=project,
+                        page_title=title,
+                    ))
+            if results:
+                return results
 
-    except json.JSONDecodeError as e:
-        print(f"\n    ⚠ Не удалось распарсить JSON для '{title}': {e}")
-        return fallback_template(page)
-    except Exception as e:
-        print(f"\n    ⚠ Ошибка LLM для '{title}': {e}")
-        return fallback_template(page)
+        except json.JSONDecodeError as e:
+            if attempt < LLM_RETRIES:
+                print(f"\n    ⚠ JSON ошибка (попытка {attempt+1}/{LLM_RETRIES+1}), повтор...", end="")
+                time.sleep(LLM_DELAY)
+            else:
+                print(f"\n    ⚠ Не удалось распарсить JSON для '{title}' после {LLM_RETRIES+1} попыток")
+                return fallback_template(page)
+        except Exception as e:
+            print(f"\n    ⚠ Ошибка LLM для '{title}': {e}")
+            return fallback_template(page)
+
+    return fallback_template(page)
 
 
 # ============================================================
-# 5. ФОЛЛБЭК — ШАБЛОННЫЕ ВОПРОСЫ (если LLM не ответила)
+# 6. ФОЛЛБЭК — ШАБЛОННЫЕ ВОПРОСЫ
 # ============================================================
 FALLBACK_TEMPLATES = [
     "Что такое {title}?",
@@ -275,7 +329,6 @@ FALLBACK_TEMPLATES = [
 
 
 def fallback_template(page: dict) -> list[dict]:
-    """Генерация по шаблонам, если LLM недоступна."""
     title = page["page_title"].replace("_", " ")
     project = page["project_name"]
     clean_text = clean_wiki_text(page["page_content"] or "")
@@ -295,7 +348,7 @@ def fallback_template(page: dict) -> list[dict]:
 
 
 # ============================================================
-# 6. ФОРМИРОВАНИЕ ShareGPT ЗАПИСИ
+# 7. ФОРМИРОВАНИЕ ShareGPT ЗАПИСИ
 # ============================================================
 def make_sharegpt_entry(question: str, answer: str, project: str, page_title: str) -> dict:
     return {
@@ -312,20 +365,59 @@ def make_sharegpt_entry(question: str, answer: str, project: str, page_title: st
 
 
 # ============================================================
-# 7. ОСНОВНОЙ ПАЙПЛАЙН
+# 8. ЗАГРУЗКА СУЩЕСТВУЮЩЕГО ДАТАСЕТА
 # ============================================================
-def build_dataset(skip_llm: bool = False) -> list[dict]:
-    print("📦 Подключение к PostgreSQL (irinka.webs.ru / wiki_production)...")
+def load_existing_dataset(output_path: str) -> list[dict]:
+    """Загружает существующий датасет для дописывания."""
+    if os.path.exists(output_path):
+        try:
+            with open(output_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            print(f"📂 Загружен существующий датасет: {len(data)} записей")
+            return data
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"⚠ Не удалось загрузить {output_path}: {e}")
+            return []
+    return []
+
+
+# ============================================================
+# 9. ОСНОВНОЙ ПАЙПЛАЙН
+# ============================================================
+def build_dataset(skip_llm: bool, output_path: str, progress_file: str) -> list[dict]:
+    # Инициализация прогресса
+    tracker = ProgressTracker(progress_file)
+    print(f"📦 Подключение к PostgreSQL (irinka.webs.ru / wiki_production)...")
+
     pages = fetch_wiki_pages(DB_CONFIG)
     print(f"📄 Найдено wiki-страниц: {len(pages)}")
 
     if not pages:
-        print("❌ Страниц не найдено. Проверьте подключение и данные в БД.")
+        print("❌ Страниц не найдено.")
         return []
 
-    # Проверяем доступность LLM
+    # Фильтрация: пропускаем уже обработанные
+    pages_to_process = []
+    pages_skipped = 0
+    for page in pages:
+        pk = page_key(page)
+        ch = content_hash(page["page_content"] or "")
+        if tracker.is_processed(pk, ch):
+            pages_skipped += 1
+        else:
+            pages_to_process.append(page)
+
+    print(f"   Уже обработано ранее: {pages_skipped}")
+    print(f"   Новых / изменённых:   {len(pages_to_process)}")
+
+    if not pages_to_process:
+        print("✅ Все страницы уже обработаны. Нечего делать.")
+        print("   Используйте --reset чтобы начать заново.")
+        return load_existing_dataset(output_path)
+
+    # Проверяем LLM
     if not skip_llm:
-        print(f"🤖 Проверка LLM (kurchatov-mini:8000)...")
+        print(f"🤖 Проверка LLM ({LLM_CONFIG['url']})...")
         try:
             test = call_llm("Ответь одним словом: работает?")
             print(f"   ✅ LLM доступна: {test[:50]}...")
@@ -334,13 +426,18 @@ def build_dataset(skip_llm: bool = False) -> list[dict]:
             print("   Переключаюсь на шаблонный режим.")
             skip_llm = True
 
-    dataset = []
+    # Загружаем существующий датасет для дописывания
+    dataset = load_existing_dataset(output_path)
+    new_count = 0
     errors = 0
 
-    for i, page in enumerate(pages):
+    for i, page in enumerate(pages_to_process):
         title = page["page_title"]
         text = page["page_content"] or ""
-        print(f"  [{i+1}/{len(pages)}] {page['project_name']} / {title} ({len(text)} симв.) ", end="")
+        pk = page_key(page)
+        ch = content_hash(text)
+
+        print(f"  [{i+1}/{len(pages_to_process)}] {page['project_name']} / {title} ({len(text)} симв.) ", end="")
 
         if skip_llm:
             examples = fallback_template(page)
@@ -351,12 +448,18 @@ def build_dataset(skip_llm: bool = False) -> list[dict]:
             time.sleep(LLM_DELAY)
 
         dataset.extend(examples)
-        print(f"→ {len(examples)} Q&A")
+        new_count += len(examples)
+
+        # Отмечаем как обработанную
+        tracker.mark_processed(pk, ch, len(examples))
+
+        print(f"→ {len(examples)} Q&A ✓")
 
     print(f"\n{'='*50}")
-    print(f"✅ Всего Q&A примеров: {len(dataset)}")
+    print(f"✅ Новых Q&A примеров:  {new_count}")
+    print(f"✅ Всего в датасете:    {len(dataset)}")
     if errors:
-        print(f"⚠  Ошибок LLM (использован фоллбэк): {errors}")
+        print(f"⚠  Ошибок LLM (фоллбэк): {errors}")
 
     return dataset
 
@@ -364,23 +467,48 @@ def build_dataset(skip_llm: bool = False) -> list[dict]:
 def main():
     parser = argparse.ArgumentParser(description="Redmine Wiki → Q&A Dataset для Qwen LoRA")
     parser.add_argument("--output", default="dataset.json",
-                        help="Путь к выходному файлу (по умолчанию: dataset.json)")
+                        help="Путь к выходному файлу")
+    parser.add_argument("--progress", default="progress.json",
+                        help="Файл прогресса (по умолчанию: progress.json)")
+    parser.add_argument("--llm-url", default=None,
+                        help="URL LLM API (например http://172.16.29.232:8000/v1/chat/completions)")
     parser.add_argument("--skip-llm", action="store_true",
                         help="Пропустить LLM, использовать только шаблоны")
+    parser.add_argument("--reset", action="store_true",
+                        help="Очистить прогресс и начать заново")
     parser.add_argument("--delay", type=float, default=1.0,
-                        help="Пауза между запросами к LLM, сек (по умолчанию: 1.0)")
+                        help="Пауза между запросами к LLM, сек")
     parser.add_argument("--qa-min", type=int, default=3,
-                        help="Минимум Q&A пар на страницу (по умолчанию: 3)")
+                        help="Минимум Q&A пар на страницу")
     parser.add_argument("--qa-max", type=int, default=7,
-                        help="Максимум Q&A пар на страницу (по умолчанию: 7)")
+                        help="Максимум Q&A пар на страницу")
+    parser.add_argument("--retries", type=int, default=2,
+                        help="Повторные попытки при ошибке JSON")
     args = parser.parse_args()
 
-    global LLM_DELAY, QA_PER_PAGE_MIN, QA_PER_PAGE_MAX
+    if args.llm_url:
+        LLM_CONFIG["url"] = args.llm_url
+        print(f"🔗 LLM URL: {args.llm_url}")
+
+    global LLM_DELAY, QA_PER_PAGE_MIN, QA_PER_PAGE_MAX, LLM_RETRIES
     LLM_DELAY = args.delay
     QA_PER_PAGE_MIN = args.qa_min
     QA_PER_PAGE_MAX = args.qa_max
+    LLM_RETRIES = args.retries
 
-    dataset = build_dataset(skip_llm=args.skip_llm)
+    # Сброс прогресса
+    if args.reset:
+        tracker = ProgressTracker(args.progress)
+        tracker.reset()
+        if os.path.exists(args.output):
+            os.remove(args.output)
+        print("🔄 Прогресс и датасет очищены.")
+
+    dataset = build_dataset(
+        skip_llm=args.skip_llm,
+        output_path=args.output,
+        progress_file=args.progress,
+    )
 
     if not dataset:
         print("❌ Датасет пуст.")
@@ -408,7 +536,6 @@ def main():
     if dataset:
         print(f"\n📝 Пример записи:")
         example = dataset[0].copy()
-        # Обрезаем ответ для вывода
         ans = example["conversations"][2]["value"]
         if len(ans) > 300:
             example["conversations"][2]["value"] = ans[:300] + "..."
