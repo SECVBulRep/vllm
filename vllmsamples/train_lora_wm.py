@@ -52,10 +52,9 @@ def train(args):
         AutoModelForCausalLM,
         AutoTokenizer,
         BitsAndBytesConfig,
-        TrainingArguments,
     )
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
-    from trl import SFTTrainer
+    from trl import SFTTrainer, SFTConfig
 
     print(f"🔧 Модель:   {args.model}")
     print(f"📄 Датасет:  {args.dataset}")
@@ -133,7 +132,7 @@ def train(args):
         print(f"   Train: {len(train_dataset)}, Eval: нет (мало данных)")
 
     # ---- Параметры обучения ----
-    training_args = TrainingArguments(
+    training_args = SFTConfig(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
@@ -153,6 +152,7 @@ def train(args):
         report_to="none",
         max_grad_norm=1.0,
         seed=42,
+        max_seq_length=args.max_seq_length,
     )
 
     # ---- Trainer ----
@@ -163,7 +163,6 @@ def train(args):
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
-        max_seq_length=args.max_seq_length,
     )
 
     trainer.train()
