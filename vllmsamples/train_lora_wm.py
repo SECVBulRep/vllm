@@ -1,15 +1,14 @@
 """
 Обучение Qwen LoRA адаптера на датасете из Redmine Wiki
-Затем запуск через vLLM.
+Совместимо с: trl==0.27.1, transformers==4.57.6, peft==0.18.1
 
 Установка:
   pip install torch transformers peft datasets accelerate bitsandbytes trl
 
 Использование:
-  # Обучение
-  python train_lora.py --dataset dataset.json --model Qwen/Qwen2.5-7B-Instruct
+  python train_lora.py --dataset dataset.json --model Qwen/Qwen2.5-7B-Instruct --use-4bit
 
-  # После обучения — запуск через vLLM:
+После обучения — запуск через vLLM:
   python -m vllm.entrypoints.openai.api_server \
     --model Qwen/Qwen2.5-7B-Instruct \
     --enable-lora \
@@ -21,23 +20,23 @@ import json
 import argparse
 import os
 import torch
-from pathlib import Path
+from datasets import Dataset
+from transformers import BitsAndBytesConfig
+from peft import LoraConfig
+from trl import SFTTrainer, SFTConfig
 
 
-def load_dataset_sharegpt(dataset_path: str):
-    """Загружает ShareGPT датасет и конвертирует в формат для trl."""
-    from datasets import Dataset
-
+def load_dataset_sharegpt(dataset_path: str) -> Dataset:
+    """Загружает ShareGPT датасет и конвертирует в messages формат."""
     with open(dataset_path, "r", encoding="utf-8") as f:
         raw_data = json.load(f)
 
-    # Конвертируем ShareGPT → messages формат
     processed = []
+    role_map = {"system": "system", "human": "user", "gpt": "assistant"}
+
     for entry in raw_data:
-        convs = entry["conversations"]
         messages = []
-        for msg in convs:
-            role_map = {"system": "system", "human": "user", "gpt": "assistant"}
+        for msg in entry["conversations"]:
             role = role_map.get(msg["from"], msg["from"])
             messages.append({"role": role, "content": msg["value"]})
         processed.append({"messages": messages})
@@ -48,14 +47,6 @@ def load_dataset_sharegpt(dataset_path: str):
 
 
 def train(args):
-    from transformers import (
-        AutoModelForCausalLM,
-        AutoTokenizer,
-        BitsAndBytesConfig,
-    )
-    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
-    from trl import SFTTrainer, SFTConfig
-
     print(f"🔧 Модель:   {args.model}")
     print(f"📄 Датасет:  {args.dataset}")
     print(f"💾 Выход:    {args.output_dir}")
@@ -63,58 +54,6 @@ def train(args):
     print(f"📊 LoRA r:   {args.lora_rank}")
     print(f"📊 Batch:    {args.batch_size}")
     print()
-
-    # ---- Токенизатор ----
-    print("📥 Загрузка токенизатора...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model,
-        trust_remote_code=True,
-        padding_side="right",
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    # ---- Квантизация (опционально) ----
-    bnb_config = None
-    if args.use_4bit:
-        print("⚡ Используется 4-bit квантизация (QLoRA)")
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        )
-
-    # ---- Модель ----
-    print("📥 Загрузка модели...")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        quantization_config=bnb_config,
-        device_map="auto",
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16 if not args.use_4bit else None,
-        attn_implementation="flash_attention_2" if args.flash_attn else None,
-    )
-
-    if args.use_4bit:
-        model = prepare_model_for_kbit_training(model)
-
-    model.config.use_cache = False
-
-    # ---- LoRA ----
-    print("🔗 Настройка LoRA...")
-    lora_config = LoraConfig(
-        r=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                        "gate_proj", "up_proj", "down_proj"],
-    )
-
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
 
     # ---- Датасет ----
     print("📄 Загрузка датасета...")
@@ -131,8 +70,34 @@ def train(args):
         eval_dataset = None
         print(f"   Train: {len(train_dataset)}, Eval: нет (мало данных)")
 
-    # ---- Параметры обучения ----
-    training_args = SFTConfig(
+    # ---- Квантизация (QLoRA) ----
+    model_kwargs = {
+        "trust_remote_code": True,
+        "torch_dtype": torch.bfloat16,
+    }
+
+    if args.use_4bit:
+        print("⚡ Используется 4-bit квантизация (QLoRA)")
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+
+    # ---- LoRA ----
+    peft_config = LoraConfig(
+        r=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj"],
+    )
+
+    # ---- SFTConfig (trl 0.27+) ----
+    sft_config = SFTConfig(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
@@ -152,25 +117,28 @@ def train(args):
         report_to="none",
         max_grad_norm=1.0,
         seed=42,
-        max_seq_length=args.max_seq_length,
+        # trl 0.27: max_length вместо max_seq_length
+        max_length=args.max_length,
+        # Передаём kwargs для AutoModelForCausalLM.from_pretrained
+        model_init_kwargs=model_kwargs,
     )
 
-    # ---- Trainer ----
-    print("\n🚀 Начало обучения...")
+    # ---- Trainer (trl 0.27 API) ----
+    print("\n🚀 Загрузка модели и начало обучения...")
     trainer = SFTTrainer(
-        model=model,
-        args=training_args,
+        model=args.model,
+        args=sft_config,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        processing_class=tokenizer,
+        peft_config=peft_config,
     )
 
+    trainer.model.print_trainable_parameters()
     trainer.train()
 
     # ---- Сохранение ----
     print(f"\n💾 Сохранение LoRA адаптера в {args.output_dir}...")
     trainer.save_model(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
 
     print(f"\n✅ Обучение завершено!")
     print(f"\n{'='*60}")
@@ -190,39 +158,21 @@ def train(args):
 def main():
     parser = argparse.ArgumentParser(description="Обучение Qwen LoRA на wiki датасете")
 
-    # Основные
-    parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct",
-                        help="Базовая модель (по умолчанию: Qwen/Qwen2.5-7B-Instruct)")
-    parser.add_argument("--dataset", default="dataset.json",
-                        help="Путь к датасету")
-    parser.add_argument("--output-dir", default="./output/qwen-wiki-lora",
-                        help="Директория для сохранения LoRA")
+    parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
+    parser.add_argument("--dataset", default="dataset.json")
+    parser.add_argument("--output-dir", default="./output/qwen-wiki-lora")
 
-    # Гиперпараметры обучения
-    parser.add_argument("--epochs", type=int, default=3,
-                        help="Количество эпох (по умолчанию: 3)")
-    parser.add_argument("--batch-size", type=int, default=2,
-                        help="Размер батча (по умолчанию: 2)")
-    parser.add_argument("--gradient-accumulation", type=int, default=8,
-                        help="Gradient accumulation steps (по умолчанию: 8)")
-    parser.add_argument("--learning-rate", type=float, default=1e-4,
-                        help="Learning rate (по умолчанию: 1e-4)")
-    parser.add_argument("--max-seq-length", type=int, default=2048,
-                        help="Макс. длина последовательности (по умолчанию: 2048)")
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--gradient-accumulation", type=int, default=8)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--max-length", type=int, default=2048)
 
-    # LoRA
-    parser.add_argument("--lora-rank", type=int, default=16,
-                        help="LoRA rank (по умолчанию: 16)")
-    parser.add_argument("--lora-alpha", type=int, default=32,
-                        help="LoRA alpha (по умолчанию: 32)")
-    parser.add_argument("--lora-dropout", type=float, default=0.05,
-                        help="LoRA dropout (по умолчанию: 0.05)")
+    parser.add_argument("--lora-rank", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=int, default=32)
+    parser.add_argument("--lora-dropout", type=float, default=0.05)
 
-    # Оптимизации
-    parser.add_argument("--use-4bit", action="store_true",
-                        help="Использовать QLoRA (4-bit квантизация)")
-    parser.add_argument("--flash-attn", action="store_true",
-                        help="Использовать Flash Attention 2")
+    parser.add_argument("--use-4bit", action="store_true")
 
     args = parser.parse_args()
     train(args)
