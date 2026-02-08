@@ -23,6 +23,16 @@ TEST_QUESTIONS = [
     "What is Capitaller passport?",
     "How to add funds to BA purses?",
     "What is X9 interface?",
+    "How to automate BA expenses operations?",
+    "What XML interface is used to send money from one purse to another?",
+    "How to accept payments on the BA site?",
+    "What documents are needed to get a Capitaller passport for a legal person?",
+    "What is the difference between X2 and X3 interfaces?",
+    "How does the WebMoney verification process work?",
+    "What are the available purse types in WebMoney?",
+    "How to set up automatic payment acceptance?",
+    "What is the role of WMID in the system?",
+    "How to check transaction history using XML interfaces?",
 ]
 
 
